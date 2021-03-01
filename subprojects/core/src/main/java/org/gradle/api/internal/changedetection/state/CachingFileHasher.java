@@ -17,6 +17,8 @@ package org.gradle.api.internal.changedetection.state;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Objects;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
 import org.gradle.api.internal.cache.StringInterner;
 import org.gradle.cache.PersistentIndexedCache;
 import org.gradle.cache.PersistentIndexedCacheParameters;
@@ -30,15 +32,20 @@ import org.gradle.internal.serialize.Encoder;
 import org.gradle.internal.serialize.HashCodeSerializer;
 import org.gradle.internal.serialize.InterningStringSerializer;
 
+import java.io.EOFException;
 import java.io.File;
+import java.util.Set;
 
 public class CachingFileHasher implements FileHasher {
-    private final PersistentIndexedCache<String, FileInfo> cache;
+    private static final Set<String> NO_PATTERNS = ImmutableSet.of();
+
+    private final PersistentIndexedCache<FileHashKey, FileInfo> cache;
     private final FileHasher delegate;
     private final FileSystem fileSystem;
     private final StringInterner stringInterner;
     private final FileTimeStampInspector timestampInspector;
     private final FileHasherStatistics.Collector statisticsCollector;
+    private final Set<String> sourceFilePatterns;
 
     public CachingFileHasher(
         FileHasher delegate,
@@ -50,15 +57,30 @@ public class CachingFileHasher implements FileHasher {
         int inMemorySize,
         FileHasherStatistics.Collector statisticsCollector
     ) {
+       this(delegate, store, stringInterner, timestampInspector, cacheName, fileSystem, inMemorySize, statisticsCollector, NO_PATTERNS);
+    }
+
+    public CachingFileHasher(
+        FileHasher delegate,
+        CrossBuildFileHashCache store,
+        StringInterner stringInterner,
+        FileTimeStampInspector timestampInspector,
+        String cacheName,
+        FileSystem fileSystem,
+        int inMemorySize,
+        FileHasherStatistics.Collector statisticsCollector,
+        Set<String> sourceFilePatterns
+    ) {
         this.delegate = delegate;
         this.fileSystem = fileSystem;
         this.cache = store.createCache(
-            PersistentIndexedCacheParameters.of(cacheName, new InterningStringSerializer(stringInterner), new FileInfoSerializer()),
+            PersistentIndexedCacheParameters.of(cacheName, new FileHashKeySerializer(stringInterner), new FileInfoSerializer()),
             inMemorySize,
             true);
         this.stringInterner = stringInterner;
         this.timestampInspector = timestampInspector;
         this.statisticsCollector = statisticsCollector;
+        this.sourceFilePatterns = sourceFilePatterns;
     }
 
     @Override
@@ -83,8 +105,9 @@ public class CachingFileHasher implements FileHasher {
 
     private FileInfo snapshot(File file, long length, long timestamp) {
         String absolutePath = file.getAbsolutePath();
+        FileHashKey key = new FileHashKey(stringInterner.intern(absolutePath), sourceFilePatterns);
         if (timestampInspector.timestampCanBeUsedToDetectFileChange(absolutePath, timestamp)) {
-            FileInfo info = cache.getIfPresent(absolutePath);
+            FileInfo info = cache.getIfPresent(key);
 
             if (info != null && length == info.length && timestamp == info.timestamp) {
                 return info;
@@ -93,13 +116,50 @@ public class CachingFileHasher implements FileHasher {
 
         HashCode hash = delegate.hash(file);
         FileInfo info = new FileInfo(hash, length, timestamp);
-        cache.put(stringInterner.intern(absolutePath), info);
+        cache.put(key, info);
         statisticsCollector.reportFileHashed(length);
         return info;
     }
 
     public void discard(String path) {
-        cache.remove(path);
+        cache.remove(new FileHashKey(path, sourceFilePatterns));
+    }
+
+    @VisibleForTesting
+    static class FileHashKey {
+        private final String path;
+        private final Set<String> sourceFilePatterns;
+
+        public FileHashKey(String path, Set<String> sourceFilePatterns) {
+            this.path = path;
+            this.sourceFilePatterns = sourceFilePatterns;
+        }
+
+        public String getPath() {
+            return path;
+        }
+
+        public Set<String> getSourceFilePatterns() {
+            return sourceFilePatterns;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) {
+                return true;
+            }
+            if (o == null || getClass() != o.getClass()) {
+                return false;
+            }
+            FileHashKey that = (FileHashKey) o;
+            return path.equals(that.path) &&
+                sourceFilePatterns.equals(that.sourceFilePatterns);
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(path, sourceFilePatterns);
+        }
     }
 
     @VisibleForTesting
@@ -116,6 +176,41 @@ public class CachingFileHasher implements FileHasher {
 
         public HashCode getHash() {
             return hash;
+        }
+    }
+
+    private static class FileHashKeySerializer extends AbstractSerializer<FileHashKey> {
+        private final InterningStringSerializer stringSerializer;
+
+        public FileHashKeySerializer(StringInterner stringInterner) {
+            this.stringSerializer = new InterningStringSerializer(stringInterner);
+        }
+
+        @Override
+        public FileHashKey read(Decoder decoder) throws EOFException, Exception {
+            String path = stringSerializer.read(decoder);
+            int patternCount = decoder.readInt();
+            Set<String> patterns;
+            if (patternCount == 0) {
+                patterns = NO_PATTERNS;
+            } else {
+                patterns = Sets.newHashSet();
+                for (int i = 0; i < patternCount; i++) {
+                    patterns.add(stringSerializer.read(decoder));
+                }
+            }
+            return new FileHashKey(path, patterns);
+        }
+
+        @Override
+        public void write(Encoder encoder, FileHashKey key) throws Exception {
+            stringSerializer.write(encoder, key.getPath());
+
+            Set<String> patterns = key.getSourceFilePatterns();
+            encoder.writeInt(patterns.size());
+            for (String pattern : patterns) {
+                stringSerializer.write(encoder, pattern);
+            }
         }
     }
 

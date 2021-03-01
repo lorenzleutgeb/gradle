@@ -22,6 +22,7 @@ import net.rubygrapefruit.platform.file.FileSystems;
 import org.apache.tools.ant.DirectoryScanner;
 import org.gradle.BuildAdapter;
 import org.gradle.StartParameter;
+import org.gradle.api.file.FileTreeElement;
 import org.gradle.api.initialization.Settings;
 import org.gradle.api.internal.DocumentationRegistry;
 import org.gradle.api.internal.GradleInternal;
@@ -38,8 +39,10 @@ import org.gradle.api.internal.changedetection.state.ResourceFilter;
 import org.gradle.api.internal.changedetection.state.ResourceSnapshotterCacheService;
 import org.gradle.api.internal.changedetection.state.SplitFileHasher;
 import org.gradle.api.internal.changedetection.state.SplitResourceSnapshotterCacheService;
+import org.gradle.api.internal.file.DefaultFileTreeElement;
 import org.gradle.api.internal.file.FileCollectionFactory;
 import org.gradle.api.internal.initialization.loadercache.DefaultClasspathHasher;
+import org.gradle.api.specs.Spec;
 import org.gradle.api.tasks.util.internal.PatternSpecFactory;
 import org.gradle.cache.CacheRepository;
 import org.gradle.cache.GlobalCacheLocations;
@@ -63,21 +66,20 @@ import org.gradle.internal.execution.fingerprint.InputFingerprinter;
 import org.gradle.internal.execution.fingerprint.impl.DefaultFileCollectionFingerprinterRegistry;
 import org.gradle.internal.execution.fingerprint.impl.DefaultInputFingerprinter;
 import org.gradle.internal.file.Stat;
-import org.gradle.internal.fingerprint.DirectorySensitivity;
 import org.gradle.internal.fingerprint.GenericFileTreeSnapshotter;
+import org.gradle.internal.fingerprint.SnapshotHashCodeNormalizer;
 import org.gradle.internal.fingerprint.classpath.ClasspathFingerprinter;
 import org.gradle.internal.fingerprint.classpath.CompileClasspathFingerprinter;
 import org.gradle.internal.fingerprint.classpath.impl.DefaultClasspathFingerprinter;
 import org.gradle.internal.fingerprint.classpath.impl.DefaultCompileClasspathFingerprinter;
-import org.gradle.internal.fingerprint.impl.AbsolutePathFileCollectionFingerprinter;
 import org.gradle.internal.fingerprint.impl.DefaultFileCollectionSnapshotter;
 import org.gradle.internal.fingerprint.impl.DefaultGenericFileTreeSnapshotter;
-import org.gradle.internal.fingerprint.impl.IgnoredPathFileCollectionFingerprinter;
-import org.gradle.internal.fingerprint.impl.NameOnlyFileCollectionFingerprinter;
-import org.gradle.internal.fingerprint.impl.RelativePathFileCollectionFingerprinter;
+import org.gradle.internal.fingerprint.impl.FileCollectionFingerprinterRegistrations;
+import org.gradle.internal.fingerprint.impl.LineEndingSnapshotHashCodeNormalizer;
 import org.gradle.internal.hash.DefaultFileHasher;
 import org.gradle.internal.hash.FileHasher;
 import org.gradle.internal.hash.HashCode;
+import org.gradle.internal.hash.LineEndingNormalizationFileHasher;
 import org.gradle.internal.hash.StreamHasher;
 import org.gradle.internal.nativeintegration.NativeCapabilities;
 import org.gradle.internal.nativeintegration.filesystem.FileSystem;
@@ -102,6 +104,7 @@ import org.gradle.internal.watch.vfs.impl.DefaultWatchableFileSystemDetector;
 import org.gradle.internal.watch.vfs.impl.LocationsWrittenByCurrentBuild;
 import org.gradle.internal.watch.vfs.impl.WatchingNotSupportedVirtualFileSystem;
 import org.gradle.internal.watch.vfs.impl.WatchingVirtualFileSystem;
+import org.gradle.normalization.internal.SourceFilePatterns;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -111,6 +114,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.gradle.internal.snapshot.CaseSensitivity.CASE_INSENSITIVE;
 import static org.gradle.internal.snapshot.CaseSensitivity.CASE_SENSITIVE;
@@ -388,36 +393,43 @@ public class VirtualFileSystemServices extends AbstractPluginServiceRegistry {
             return new DefaultOutputSnapshotter(fileCollectionSnapshotter);
         }
 
-        AbsolutePathFileCollectionFingerprinter createAbsolutePathFileCollectionFingerprinter(FileCollectionSnapshotter fileCollectionSnapshotter) {
-            return new AbsolutePathFileCollectionFingerprinter(DirectorySensitivity.DEFAULT, fileCollectionSnapshotter);
+        SourceFilePatterns createSourceFilePatterns() {
+            return new SourceFilePatterns();
         }
 
-        AbsolutePathFileCollectionFingerprinter createAbsolutePathIgnoreDirectoriesFileCollectionFingerprinter(FileCollectionSnapshotter fileCollectionSnapshotter) {
-            return new AbsolutePathFileCollectionFingerprinter(DirectorySensitivity.IGNORE_DIRECTORIES, fileCollectionSnapshotter);
+        FileCollectionFingerprinterRegistrations createFileCollectionFingerprinterRegistrations(
+            BuildSessionScopeFileTimeStampInspector fileTimeStampInspector,
+            CrossBuildFileHashCache cacheAccess,
+            FileSystem fileSystem,
+            StreamHasher streamHasher,
+            StringInterner stringInterner,
+            FileHasherStatistics.Collector statisticsCollector,
+            SourceFilePatterns sourceFilePatterns,
+            FileCollectionSnapshotter fileCollectionSnapshotter
+        ) {
+            CachingFileHasher lineEndingNormalizingHasher = new CachingFileHasher(
+                new LineEndingNormalizationFileHasher(streamHasher),
+                cacheAccess,
+                stringInterner,
+                fileTimeStampInspector,
+                CrossBuildFileHashCache.Kind.FILE_HASHES.getCacheId(),
+                fileSystem,
+                FILE_HASHER_MEMORY_CACHE_SIZE,
+                statisticsCollector,
+                sourceFilePatterns.getIncludes()
+            );
+            Spec<FileTreeElement> spec = sourceFilePatterns.getAsSpec();
+            SnapshotHashCodeNormalizer snapshotHashCodeNormalizer = new LineEndingSnapshotHashCodeNormalizer(file -> spec.isSatisfiedBy(DefaultFileTreeElement.of(file, fileSystem)), lineEndingNormalizingHasher);
+            return new FileCollectionFingerprinterRegistrations(stringInterner, fileCollectionSnapshotter, snapshotHashCodeNormalizer);
         }
 
-        RelativePathFileCollectionFingerprinter createRelativePathFileCollectionFingerprinter(StringInterner stringInterner, FileCollectionSnapshotter fileCollectionSnapshotter) {
-            return new RelativePathFileCollectionFingerprinter(stringInterner, DirectorySensitivity.DEFAULT, fileCollectionSnapshotter);
-        }
-
-        RelativePathFileCollectionFingerprinter createRelativePathIgnoreDirectoriesFileCollectionFingerprinter(StringInterner stringInterner, FileCollectionSnapshotter fileCollectionSnapshotter) {
-            return new RelativePathFileCollectionFingerprinter(stringInterner, DirectorySensitivity.IGNORE_DIRECTORIES, fileCollectionSnapshotter);
-        }
-
-        NameOnlyFileCollectionFingerprinter createNameOnlyFileCollectionFingerprinter(FileCollectionSnapshotter fileCollectionSnapshotter) {
-            return new NameOnlyFileCollectionFingerprinter(DirectorySensitivity.DEFAULT, fileCollectionSnapshotter);
-        }
-
-        NameOnlyFileCollectionFingerprinter createNameOnlyIgnoreDirectoriesFileCollectionFingerprinter(FileCollectionSnapshotter fileCollectionSnapshotter) {
-            return new NameOnlyFileCollectionFingerprinter(DirectorySensitivity.IGNORE_DIRECTORIES, fileCollectionSnapshotter);
-        }
-
-        IgnoredPathFileCollectionFingerprinter createIgnoredPathFileCollectionFingerprinter(FileCollectionSnapshotter fileCollectionSnapshotter) {
-            return new IgnoredPathFileCollectionFingerprinter(fileCollectionSnapshotter);
-        }
-
-        FileCollectionFingerprinterRegistry createFileCollectionFingerprinterRegistry(List<FileCollectionFingerprinter> fingerprinters) {
-            return new DefaultFileCollectionFingerprinterRegistry(fingerprinters);
+        FileCollectionFingerprinterRegistry createFileCollectionFingerprinterRegistry(List<FileCollectionFingerprinter> fingerprinters, FileCollectionFingerprinterRegistrations fileCollectionFingerprinterRegistrations) {
+            return new DefaultFileCollectionFingerprinterRegistry(
+                Stream.concat(
+                    fileCollectionFingerprinterRegistrations.getRegistrants().stream(),
+                    fingerprinters.stream()
+                ).collect(Collectors.toList())
+            );
         }
 
         InputFingerprinter createInputFingerprinter(
